@@ -42,6 +42,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * MySQL → ClickHouse CDC 同步入口，内嵌 Flink 本地集群运行：
@@ -71,7 +72,7 @@ public class CdcApplication {
         }
     }
 
-    private static void run(String[] args) throws Exception {
+    static void run(String[] args) throws Exception {
         Path configFile = Paths.get("conf/application.properties");
         boolean fresh = false;
         boolean verify = false;
@@ -140,6 +141,11 @@ public class CdcApplication {
         restorePath.ifPresentOrElse(
                 p -> LOG.info("从 checkpoint 恢复: {}", p),
                 () -> LOG.info("未使用 checkpoint，按 startup.mode={} 启动", config.getStartupMode()));
+        // 目标库变化不受 --force-resume 影响：旧位点之前的数据都在原来的库里，续写到新库必然缺少历史数据
+        Path targetDatabasesFile = checkpointDir.resolve("target-databases.txt");
+        if (restorePath.isPresent()) {
+            checkTargetDatabasesUnchanged(config, targetDatabasesFile);
+        }
 
         // 1. 扫描源表；全新同步时预建 / 校正目标表（全量同步前按配置清空），续传时目标表结构交由回放的 DDL 推进
         if (health != null) {
@@ -158,6 +164,8 @@ public class CdcApplication {
         }
         Files.createDirectories(checkpointDir);
         Files.writeString(scopeFile, config.describeSyncScope());
+        Files.write(targetDatabasesFile, config.getTargetDatabases().entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.toList()));
         Files.write(noPrimaryKeyFile, scan.noPrimaryKeyTables);
         Set<String> noPrimaryKeyTables = scan.noPrimaryKeyTables;
 
@@ -198,6 +206,35 @@ public class CdcApplication {
                 // 已在关闭流程中
             }
             System.exit(1);
+        }
+    }
+
+    /**
+     * 续传前检查已同步的源库写入的 ClickHouse 库是否变化（clickhouse.database-mapping）。
+     * 新增的源库不在此检查，由同步范围检查处理。
+     */
+    static void checkTargetDatabasesUnchanged(CdcConfig config, Path targetDatabasesFile) throws Exception {
+        if (!Files.exists(targetDatabasesFile)) {
+            return;
+        }
+        Map<String, String> current = config.getTargetDatabases();
+        List<String> changed = new ArrayList<>();
+        for (String line : Files.readAllLines(targetDatabasesFile)) {
+            int i = line.indexOf('=');
+            if (i <= 0) {
+                continue;
+            }
+            String source = line.substring(0, i);
+            String previous = line.substring(i + 1);
+            String now = current.get(source);
+            if (now != null && !now.equals(previous)) {
+                changed.add(source + "：" + previous + " -> " + now);
+            }
+        }
+        if (!changed.isEmpty()) {
+            throw new IllegalStateException("写入的 ClickHouse 库发生变化（clickhouse.database-mapping）：" + changed
+                    + "\n续传只会把之后的变更写入新库，新库缺少全部历史数据，--force-resume 也不能跳过此检查。"
+                    + "请恢复原来的映射；或使用 --fresh 重新全量同步到新库（会删除旧进度、清空新库中的同名表，原来的库保持不动）。");
         }
     }
 
