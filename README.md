@@ -69,49 +69,68 @@ K8s 通过 Harbor 的 `ghcr` 代理项目拉取：`registry.bstllm.com/ghcr/<own
 
 ## K8s 部署
 
-清单位于 `deploy/k8s`（kustomize）：
-
-| 文件 | 说明 |
-|---|---|
-| `application.properties` | 同步配置，生成带内容哈希的 ConfigMap 挂载到 `/app/conf`，修改后 apply 会自动滚动重启 |
-| `secret.example.yaml` | `MYSQL_PASSWORD` / `CLICKHOUSE_PASSWORD` 示例，以环境变量注入，配置中用 `${MYSQL_PASSWORD}` 引用。**不在 kustomize 资源中**，避免 apply 时用示例值覆盖真实密码 |
-| `statefulset.yaml` | 单副本 StatefulSet + PVC（`/app/data` 保存同步进度） |
-| `service.yaml` | StatefulSet 所需的 headless Service，暴露健康检查端口 |
+清单只有一个文件 `deploy/k8s/clickhouse-cdc.yaml`（Secret + ConfigMap + PVC + Deployment）。只需填写数据库连接信息和密码，并行度、批次、JVM 堆等按容器内存自动计算。
 
 ```bash
-# 1. 构建镜像并推送到镜像仓库
-mvn clean package -DskipTests
-docker build -t ghcr.io/<owner>/clickhouse-cdc:latest .
-docker push ghcr.io/<owner>/clickhouse-cdc:latest
+# 1. 修改清单中的密码、MySQL / ClickHouse 连接、要同步的库，按需调整镜像地址和 storageClassName
+vi deploy/k8s/clickhouse-cdc.yaml
 
-# 2. 创建密码 Secret（只需一次）
-kubectl create secret generic clickhouse-cdc-secret \
-  --from-literal=MYSQL_PASSWORD='***' --from-literal=CLICKHOUSE_PASSWORD='***'
+# 2. 部署
+kubectl -n <命名空间> apply -f deploy/k8s/clickhouse-cdc.yaml
 
-# 3. 修改 deploy/k8s/application.properties，以及 kustomization.yaml 中的镜像地址 / 命名空间，然后部署（kubectl >= 1.27）
-kubectl apply -k deploy/k8s
+# 修改配置或更新镜像后重启生效
+kubectl -n <命名空间> rollout restart deploy/clickhouse-cdc
 
 # 查看同步状态 / 日志
-kubectl get pod -l app.kubernetes.io/name=clickhouse-cdc
-kubectl port-forward clickhouse-cdc-0 8080:8080 &   # 然后 curl localhost:8080/status
-kubectl logs -f clickhouse-cdc-0
+kubectl -n <命名空间> logs -f deploy/clickhouse-cdc
+kubectl -n <命名空间> port-forward deploy/clickhouse-cdc 8080:8080 &   # 然后 curl localhost:8080/status
 
 # 数据核对
-kubectl exec clickhouse-cdc-0 -- sh -c 'exec java -Dlogback.configurationFile=logback-console.xml -jar /app/clickhouse-cdc.jar --config /app/conf/application.properties --verify'
+kubectl -n <命名空间> exec deploy/clickhouse-cdc -- sh -c 'exec java -Dlogback.configurationFile=logback-console.xml -jar /app/clickhouse-cdc.jar --config /app/conf/application.properties --verify'
 ```
 
 部署要点：
 
-- **只能单副本**：多个实例会重复消费 binlog 并争用同一份进度，不要调大 `replicas`。
+- **只能单副本**：多个实例会重复消费 binlog 并争用同一份进度，不要调大 `replicas`；更新策略为 `Recreate`，先停旧 Pod 再启动新 Pod。
 - **同步进度在 PVC 上**：Pod 重建、节点迁移后从原 binlog 位点续传；删除 PVC 等于丢失进度，下次启动会重新全量。
-- **优雅退出**：Pod 删除 / 滚动更新时 java 进程收到 SIGTERM，先 stop-with-savepoint 再退出；`terminationGracePeriodSeconds: 180` 需大于 savepoint 等待时间（120 秒）。
-- **探针**：`/healthz` 只检查进程存活（MySQL / ClickHouse 暂时不可用时作业在进程内自动重试，不重建 Pod）；`/readyz` 在作业 RUNNING 时就绪；启动阶段预建表较慢，`startupProbe` 最长等待 10 分钟。启动失败时进程以非 0 退出码结束，由 K8s 重启。
-- **重新全量**：在 `statefulset.yaml` 的 `args` 中临时加上 `--fresh` 后 apply，确认新作业已产生 checkpoint 后再去掉并 apply（否则之后每次重启都会重新全量）。`--fresh` 会删除旧进度，中途退出也不会退回旧位点。
-- **时区**：`source.server-time-zone` 必须与 MySQL 一致（容器默认 UTC，已在清单中设置 `TZ=Asia/Shanghai`）。
-- **server-id**：K8s 中建议固定 `source.server-id` 区间，避免与其他从库 / CDC 任务冲突。
-- **资源**：默认 requests 1C/2Gi、limits 4C/2Gi，JVM 堆占容器内存 60%，其余留给 Flink 网络缓冲与托管内存；表多、批次大时适当调大。
+- **优雅退出**：Pod 删除 / 重启时 java 进程收到 SIGTERM，先 stop-with-savepoint 再退出；`terminationGracePeriodSeconds: 180` 需大于 savepoint 等待时间（120 秒）。
+- **探针**：`/healthz` 只检查进程存活（MySQL / ClickHouse 暂时不可用时作业在进程内自动重试，不重建 Pod）；`/readyz` 在作业 RUNNING 时就绪；启动阶段预建表较慢，`startupProbe` 最长等待 10 分钟。启动失败时进程以非 0 退出码结束，由 K8s 重启。需要配置 `health.port=8080`（清单中已配置）。
+- **重新全量**：在 `args` 中临时加上 `--fresh` 后 apply，确认新作业已产生 checkpoint 后再去掉并 apply（否则之后每次重启都会重新全量）。`--fresh` 会删除旧进度，中途退出也不会退回旧位点。
+- **时区**：镜像默认 `TZ=Asia/Shanghai`；MySQL 不是该时区时配置 `source.server-time-zone`。
+- **server-id**：建议固定 `source.server-id` 区间，避免与其他从库 / CDC 任务冲突。
+- **资源**：只需设置 `limits.memory`（建议至少 1Gi）：镜像启动脚本按它计算 JVM 堆，程序再按堆大小计算并行度、分片大小、写入缓冲（见"内存与资源自适应"）。
+- **NAS 存储**：NFS 卷不支持 fsGroup 自动改属主，清单中的 initContainer 会先把数据目录交给运行用户；云盘等块存储可删除该 initContainer。
 
 本地运行时健康检查默认关闭（`health.port=0`），日志同时输出到控制台和 `logs/`；容器内通过 `-Dlogback.configurationFile=logback-console.xml` 只输出到标准输出。
+
+## 内存与资源自适应
+
+同一个程序要在大小不同的机器 / 容器、大小不同的库上运行，与内存相关的参数默认为 `auto`，启动时按 **JVM 堆上限、CPU 核数、源表统计信息** 计算（显式配置的值保持不变），并打印到日志：
+
+```
+资源参数（堆上限 512MB，CPU 12 核，4 张表）：job.parallelism=1(auto)，source.split-size=8096(auto)，source.fetch-size=1024(auto)，sink.batch.max-bytes=16MB(auto)，sink.buffer.max-total-bytes=64MB(auto)
+```
+
+| 配置 | auto 的计算方式 | 限制的内存 |
+|---|---|---|
+| `job.parallelism` | min(4, CPU 核数, 可用堆 / 128MB)，且不超过 `source.server-id` 区间大小 | 全量阶段同时读取的分片数 |
+| `source.split-size` | 每个读取实例分到可用堆的 30%，按源表行数与平均行长估算一个分片的内存，宽表、大字段表自动调小（256 ~ 8096）；整表都放得下的小表不参与计算 | 全量快照：Flink CDC 读一个分片时整片放在内存中 |
+| `source.chunk-key.even-distribution.factor.upper-bound` | 固定默认 2（Flink CDC 默认 1000） | 主键分布系数不超过该值时按主键范围直接切分，主键分布不均时一个分片最多有 分片行数 × 该值 行；超过时逐个分片查询边界，分片行数严格受控 |
+| `source.fetch-size` | min(1024, 分片行数) | 每次从 MySQL 拉取的行数 |
+| `sink.buffer.max-total-bytes` | 可用堆的 1/5（8MB ~ 512MB） | 所有表写入缓冲合计（各写入实例平分），超过时全部写出 |
+| `sink.batch.max-bytes` | 缓冲合计上限的 1/4（1MB ~ 64MB） | 单张表的写入缓冲 |
+| `source.debezium.max.queue.size` / `max.batch.size` | 可用堆的 10% ÷ 最宽表的单行内存（256 ~ 8192 条），批次为其 1/4 | 增量阶段 Debezium 事件队列，宽表、大字段表自动缩短 |
+
+可用堆 = max(堆上限 − 192MB, 堆上限 / 2)。这些参数只在内存确实不够时才会往下调，分片行数、Debezium 队列的上限就是 Flink CDC 的默认值，批次上限在 2Gi 容器中约 60MB，不会为了省内存牺牲吞吐。
+
+**反压**：写入 ClickHouse 是同步的，ClickHouse 变慢或不可用时上游自动暂停读取，积压留在 MySQL binlog 中，内存不随积压增长。
+
+仍然内存不足时（例如单行就有几十 MB 的大字段），JVM 以 `-XX:+ExitOnOutOfMemoryError` 退出，由 K8s / systemd 重启后从 checkpoint 续传，不丢数据。频繁出现时请增加内存。
+
+**JVM 堆大小**：
+
+- 容器中由 `docker-entrypoint.sh` 按容器内存上限计算：堆 = 上限 − 640MB，限制在上限的 50% ~ 70%（1Gi → 512MB，2Gi → 1408MB，4Gi → 2867MB）。堆外内存（类元数据、线程、GC、网络缓冲）实测约 300MB 以上，按固定比例分配的话小容器容易超限被 OOMKilled。`JAVA_OPTS` 中指定了 `-Xmx` / `MaxRAMPercentage` 时以指定的为准。
+- `java -jar` 直接运行时用 `-Xmx` 指定，建议至少 512MB；不指定时 JVM 默认使用物理内存的 1/4。
 
 ## 启动与续传
 

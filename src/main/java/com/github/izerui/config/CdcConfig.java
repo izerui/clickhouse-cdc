@@ -38,8 +38,15 @@ public class CdcConfig implements Serializable {
     private final Map<String, String> props;
 
     public CdcConfig(Map<String, String> props) {
+        this(props, true);
+    }
+
+    private CdcConfig(Map<String, String> props, boolean resolvePlaceholders) {
         Map<String, String> resolved = new TreeMap<>();
-        props.forEach((k, v) -> resolved.put(k.trim(), resolvePlaceholders(v == null ? "" : v.trim())));
+        props.forEach((k, v) -> {
+            String value = v == null ? "" : v.trim();
+            resolved.put(k.trim(), resolvePlaceholders ? resolvePlaceholders(value) : value);
+        });
         this.props = Collections.unmodifiableMap(resolved);
         validate();
     }
@@ -104,7 +111,23 @@ public class CdcConfig implements Serializable {
         }
     }
 
+    /**
+     * 返回覆盖了部分配置项的新配置（用于写入启动时自动计算出的资源参数）。
+     */
+    public CdcConfig withOverrides(Map<String, String> overrides) {
+        Map<String, String> merged = new LinkedHashMap<>(props);
+        merged.putAll(overrides);
+        // 已有的值在加载时已替换过占位符，不再替换（例如密码中恰好含有 ${...}）
+        return new CdcConfig(merged, false);
+    }
+
     // ============================== 通用读取 ==============================
+
+    /** 未配置、为空或为 auto：由程序按运行环境自动计算 */
+    public boolean isAuto(String key) {
+        String v = props.get(key);
+        return v == null || v.isEmpty() || v.equalsIgnoreCase("auto");
+    }
 
     public String get(String key, String defaultValue) {
         String v = props.get(key);
@@ -112,13 +135,11 @@ public class CdcConfig implements Serializable {
     }
 
     public int getInt(String key, int defaultValue) {
-        String v = props.get(key);
-        return v == null || v.isEmpty() ? defaultValue : Integer.parseInt(v);
+        return isAuto(key) ? defaultValue : Integer.parseInt(props.get(key));
     }
 
     public long getLong(String key, long defaultValue) {
-        String v = props.get(key);
-        return v == null || v.isEmpty() ? defaultValue : Long.parseLong(v);
+        return isAuto(key) ? defaultValue : Long.parseLong(props.get(key));
     }
 
     public boolean getBoolean(String key, boolean defaultValue) {
@@ -203,6 +224,15 @@ public class CdcConfig implements Serializable {
         return getInt("source.split-size", 8096);
     }
 
+    /**
+     * 主键分布系数 (MAX - MIN + 1) / 行数 不超过该值时按主键范围均匀切分分片，否则逐个分片查询边界。
+     * 均匀切分时主键分布不均的区间可能包含 分片行数 × 系数 行，因此默认值比 Flink CDC 的 1000 小得多，
+     * 保证单个分片的内存可控。
+     */
+    public double getSourceEvenDistributionFactorUpper() {
+        return Double.parseDouble(get("source.chunk-key.even-distribution.factor.upper-bound", "2.0"));
+    }
+
     public int getSourceConnectionPoolSize() {
         return getInt("source.connection-pool-size", 20);
     }
@@ -273,6 +303,11 @@ public class CdcConfig implements Serializable {
     /** 单表缓冲的最大字节数，超过即写出，避免宽表占用过多内存 */
     public long getSinkBatchMaxBytes() {
         return getLong("sink.batch.max-bytes", 64L * 1024 * 1024);
+    }
+
+    /** 所有表写入缓冲合计的最大字节数（各写入实例平分），超过即全部写出 */
+    public long getSinkBufferMaxTotalBytes() {
+        return getLong("sink.buffer.max-total-bytes", 256L * 1024 * 1024);
     }
 
     public int getSinkMaxRetries() {

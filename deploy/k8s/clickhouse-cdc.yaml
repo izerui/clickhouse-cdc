@@ -1,0 +1,145 @@
+# MySQL -> ClickHouse 实时同步（全量 + 增量）
+# 部署：修改下面的密码和连接信息后 kubectl -n <命名空间> apply -f clickhouse-cdc.yaml
+# 修改配置后执行 kubectl -n <命名空间> rollout restart deploy/clickhouse-cdc 生效
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clickhouse-cdc-secret
+type: Opaque
+stringData:
+  MYSQL_PASSWORD: "change-me"
+  CLICKHOUSE_PASSWORD: ""
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-cdc-config
+data:
+  # 只需配置连接信息；并行度、分片、批次、缓冲按容器内存自动计算，其余配置项见工程中的 conf/application.properties
+  application.properties: |
+    source.hostname=mysql.example.com
+    source.port=3306
+    # 需要 SELECT、RELOAD、SHOW DATABASES、REPLICATION SLAVE、REPLICATION CLIENT 权限
+    source.username=cdc
+    source.password=${MYSQL_PASSWORD}
+    # 要同步的库，逗号分隔
+    source.databases=demo
+    # 只同步指定的表（逗号分隔），留空同步全部有主键的表
+    source.tables=
+    # 固定一个不与 MySQL 其他从库 / DTS / CDC 任务冲突的区间（大小即并行度上限）
+    source.server-id=5400-5403
+
+    clickhouse.url=http://clickhouse:8123
+    clickhouse.username=default
+    clickhouse.password=${CLICKHOUSE_PASSWORD}
+
+    # K8s 探针使用
+    health.port=8080
+
+---
+# 同步进度（checkpoint），删除 PVC 等于丢失进度，下次启动会重新全量
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-cdc-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: nas
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-cdc
+spec:
+  # 只能是 1：多个实例会重复消费 binlog，并争用同一份同步进度
+  replicas: 1
+  # 先停旧 Pod（保存进度）再启动新 Pod
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: clickhouse-cdc
+  template:
+    metadata:
+      labels:
+        app: clickhouse-cdc
+    spec:
+      # 大于 stop-with-savepoint 的等待时间（120 秒）
+      terminationGracePeriodSeconds: 180
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      # NAS（NFS）卷不支持 fsGroup 自动改属主，启动前以 root 把数据目录交给运行用户；云盘等块存储可删除
+      initContainers:
+        - name: fix-data-permission
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /app/data"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      containers:
+        - name: clickhouse-cdc
+          # 经 Harbor 代理拉取时改为 registry.bstllm.com/ghcr/izerui/clickhouse-cdc:latest，并加上 imagePullSecrets
+          image: ghcr.io/izerui/clickhouse-cdc:latest
+          imagePullPolicy: Always
+          # 需要重新全量同步时临时加上 ["--fresh"]，确认已产生 checkpoint 后再去掉
+          args: []
+          envFrom:
+            - secretRef:
+                name: clickhouse-cdc-secret
+          ports:
+            - name: health
+              containerPort: 8080
+          # 启动时要扫描源表、预建目标表，最长等待 10 分钟
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 60
+          # 只检查进程存活：MySQL / ClickHouse 暂时不可用时作业在进程内自动重试
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # 只需设置内存上限：JVM 堆、并行度、批次等按它自动计算，建议至少 1Gi
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/conf
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: config
+          configMap:
+            name: clickhouse-cdc-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: clickhouse-cdc-data

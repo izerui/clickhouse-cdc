@@ -35,6 +35,7 @@ public final class MySqlSourceFactory {
                 .includeSchemaChanges(true)
                 .scanNewlyAddedTableEnabled(false)
                 .splitSize(config.getSourceSplitSize())
+                .distributionFactorUpper(config.getSourceEvenDistributionFactorUpper())
                 .fetchSize(config.getSourceFetchSize())
                 .connectionPoolSize(config.getSourceConnectionPoolSize())
                 .connectTimeout(Duration.ofSeconds(config.getSourceConnectTimeoutSeconds()))

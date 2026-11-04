@@ -1,3 +1,4 @@
 *
 !target/clickhouse-cdc.jar
 !conf/application.properties
+!docker-entrypoint.sh

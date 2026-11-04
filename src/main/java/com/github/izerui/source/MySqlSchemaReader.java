@@ -69,13 +69,15 @@ public class MySqlSchemaReader {
     public List<TableDef> readTables(Connection conn, String database) throws SQLException {
         Map<String, TableDef> tables = new LinkedHashMap<>();
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES "
+                "SELECT TABLE_NAME, TABLE_COMMENT, AVG_ROW_LENGTH, TABLE_ROWS FROM information_schema.TABLES "
                         + "WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME")) {
             ps.setString(1, database);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     TableDef t = new TableDef(database, rs.getString(1));
                     t.comment = rs.getString(2);
+                    t.avgRowLength = rs.getLong(3);
+                    t.estimatedRows = rs.getLong(4);
                     tables.put(t.table, t);
                 }
             }

@@ -2,7 +2,6 @@ package com.github.izerui.clickhouse;
 
 import com.github.izerui.config.CdcConfig;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.URI;
@@ -58,12 +57,12 @@ public class ClickHouseClient implements Serializable {
 
     /** 执行 DDL 或其他无返回值的语句 */
     public void execute(String sql) {
-        send(URI.create(url + "/"), sql.getBytes(StandardCharsets.UTF_8), false);
+        send(URI.create(url + "/"), sql.getBytes(StandardCharsets.UTF_8));
     }
 
     /** 执行查询，返回 TabSeparated 解析后的行 */
     public List<String[]> query(String sql) {
-        String body = send(URI.create(url + "/"), (sql + " FORMAT TabSeparated").getBytes(StandardCharsets.UTF_8), false);
+        String body = send(URI.create(url + "/"), (sql + " FORMAT TabSeparated").getBytes(StandardCharsets.UTF_8));
         List<String[]> rows = new ArrayList<>();
         for (String line : body.split("\n")) {
             if (line.isEmpty()) {
@@ -84,24 +83,36 @@ public class ClickHouseClient implements Serializable {
      * @param columns 列名（已转义），与 tsv 中的列一一对应
      */
     public void insert(String database, String table, List<String> columns, byte[] tsv) {
+        insert(database, table, columns, tsv, tsv.length);
+    }
+
+    /** 写入 tsv[0, length) */
+    public void insert(String database, String table, List<String> columns, byte[] tsv, int length) {
         String sql = "INSERT INTO " + ClickHouseSql.quote(database) + "." + ClickHouseSql.quote(table)
                 + " (" + String.join(", ", columns) + ") FORMAT TabSeparated";
         URI uri = URI.create(url + "/?input_format_null_as_default=1&query="
                 + URLEncoder.encode(sql, StandardCharsets.UTF_8));
-        send(uri, tsv, compress);
+        send(uri, tsv, length, compress);
     }
 
-    private String send(URI uri, byte[] body, boolean gzip) {
+    private String send(URI uri, byte[] body) {
+        return send(uri, body, body.length, false);
+    }
+
+    private String send(URI uri, byte[] body, int length, boolean gzip) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofMillis(socketTimeoutMs))
                 .header("X-ClickHouse-User", username)
                 .header("X-ClickHouse-Key", password == null ? "" : password);
-        byte[] payload = body;
+        HttpRequest.BodyPublisher publisher;
         if (gzip) {
-            payload = gzip(body);
+            ExposedByteArrayOutputStream compressed = gzip(body, length);
+            publisher = HttpRequest.BodyPublishers.ofByteArray(compressed.array(), 0, compressed.size());
             builder.header("Content-Encoding", "gzip");
+        } else {
+            publisher = HttpRequest.BodyPublishers.ofByteArray(body, 0, length);
         }
-        HttpRequest request = builder.POST(HttpRequest.BodyPublishers.ofByteArray(payload)).build();
+        HttpRequest request = builder.POST(publisher).build();
         HttpResponse<String> response;
         try {
             response = http().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -117,14 +128,14 @@ public class ClickHouseClient implements Serializable {
         return response.body();
     }
 
-    private static byte[] gzip(byte[] data) {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(64, data.length / 4));
+    private static ExposedByteArrayOutputStream gzip(byte[] data, int length) {
+        ExposedByteArrayOutputStream bos = new ExposedByteArrayOutputStream(Math.max(64, length / 4));
         try (GZIPOutputStream gz = new GZIPOutputStream(bos, 64 * 1024)) {
-            gz.write(data);
+            gz.write(data, 0, length);
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
-        return bos.toByteArray();
+        return bos;
     }
 
     @Override

@@ -3,6 +3,7 @@ package com.github.izerui.sink;
 import com.github.izerui.clickhouse.ClickHouseClient;
 import com.github.izerui.clickhouse.ClickHouseException;
 import com.github.izerui.clickhouse.ClickHouseSql;
+import com.github.izerui.clickhouse.ExposedByteArrayOutputStream;
 import com.github.izerui.clickhouse.SchemaSynchronizer;
 import com.github.izerui.clickhouse.TsvEncoder;
 import com.github.izerui.config.CdcConfig;
@@ -24,7 +25,6 @@ import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayOutputStream;
 import java.sql.Connection;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -51,6 +51,9 @@ import java.util.concurrent.ThreadLocalRandom;
  *     写入暂存事件。这样任何故障恢复都只会回放 DDL 之后的数据，不会出现“目标表结构已变更、又回放变更前的数据”
  *     （否则列改名会被当成删除、类型变更后回放旧值会写入失败）；</li>
  *     <li>只写目标表中存在的列：源表已删除的列在回放的旧数据中出现时忽略该列而不是写入失败。</li>
+ *     <li>内存上限：单表缓冲不超过 sink.batch.max-bytes，本实例所有表的缓冲合计不超过
+ *     sink.buffer.max-total-bytes / 并行度（超过时全部写出）。写出是同步的，写得慢时 Flink 反压会让上游暂停读取，
+ *     积压留在 MySQL binlog 中而不是内存里。</li>
  * </ul>
  */
 public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, Void>
@@ -85,6 +88,10 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
     private transient long lastVersion;
     private transient long writtenRows;
     private transient long lastStatsTime;
+    /** 本实例所有表缓冲的字节数合计 */
+    private transient long bufferedBytes;
+    /** 本实例缓冲合计上限 */
+    private transient long maxBufferedBytes;
 
     public ClickHouseWriter(CdcConfig config) {
         this.config = config;
@@ -103,6 +110,8 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
         pendingState = getRuntimeContext().getListState(
                 new ListStateDescriptor<>("pending-events", TypeInformation.of(PendingEntry.class)));
         lastStatsTime = System.currentTimeMillis();
+        // 同一进程内的各写入实例平分缓冲额度
+        maxBufferedBytes = config.getSinkBufferMaxTotalBytes() / getRuntimeContext().getNumberOfParallelSubtasks();
     }
 
     @Override
@@ -148,6 +157,7 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
             timerService.registerProcessingTimeTimer(timerService.currentProcessingTime() + config.getSinkBatchIntervalMs());
         }
 
+        long sizeBefore = buffer.data.size();
         switch (event.op) {
             case READ:
                 // 全量快照版本固定为 0：增量阶段的任何变更都比快照新
@@ -169,8 +179,14 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
             default:
                 return;
         }
+        bufferedBytes += buffer.data.size() - sizeBefore;
         if (buffer.rows >= config.getSinkBatchSize() || buffer.data.size() >= config.getSinkBatchMaxBytes()) {
             flush(key);
+        } else if (bufferedBytes > maxBufferedBytes) {
+            // 表很多、每张表都没满批时，合计也不能超过上限
+            for (String k : new ArrayList<>(buffers.keySet())) {
+                flush(k);
+            }
         }
     }
 
@@ -287,7 +303,7 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
         boolean schemaResynced = false;
         for (int attempt = 0; ; attempt++) {
             try {
-                client.insert(buffer.database, buffer.table, buffer.quotedColumns(), buffer.data.toByteArray());
+                client.insert(buffer.database, buffer.table, buffer.quotedColumns(), buffer.data.array(), buffer.data.size());
                 break;
             } catch (ClickHouseException e) {
                 if (!schemaResynced && isSchemaMismatch(e)) {
@@ -307,6 +323,7 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
             }
         }
         buffers.remove(key);
+        bufferedBytes -= buffer.data.size();
         writtenRows += buffer.rows;
         LOG.debug("写入 {} {} 行", key, buffer.rows);
         long now = System.currentTimeMillis();
@@ -468,7 +485,7 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
         final List<String> columns;
         /** 与 columns 对应，false 表示目标表没有该列、不写入 */
         final boolean[] writable;
-        final ByteArrayOutputStream data = new ByteArrayOutputStream(64 * 1024);
+        final ExposedByteArrayOutputStream data = new ExposedByteArrayOutputStream(64 * 1024);
         int rows;
 
         TableBuffer(String database, String table, List<String> columns, boolean[] writable) {

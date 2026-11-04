@@ -4,6 +4,7 @@ import com.github.izerui.clickhouse.ClickHouseClient;
 import com.github.izerui.clickhouse.TargetTableInitializer;
 import com.github.izerui.config.CdcConfig;
 import com.github.izerui.config.CheckpointLocator;
+import com.github.izerui.config.ResourcePlanner;
 import com.github.izerui.health.HealthServer;
 import com.github.izerui.model.ChangeEvent;
 import com.github.izerui.model.TableDef;
@@ -13,6 +14,7 @@ import com.github.izerui.source.TableFilter;
 import com.github.izerui.verify.DataVerifier;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.ClusterOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.RestOptions;
@@ -159,19 +161,22 @@ public class CdcApplication {
         Files.write(noPrimaryKeyFile, scan.noPrimaryKeyTables);
         Set<String> noPrimaryKeyTables = scan.noPrimaryKeyTables;
 
-        // 2. 构建作业
-        StreamExecutionEnvironment env = createEnvironment(config, checkpointDir, restorePath.orElse(null));
-        TableFilter tableFilter = TableFilter.fromConfig(config, noPrimaryKeyTables);
-        env.fromSource(MySqlSourceFactory.create(config, tableFilter), WatermarkStrategy.noWatermarks(), "MySQL CDC Source")
+        // 2. 按堆内存、CPU 与源表规模计算未显式配置的并行度、分片大小、写入缓冲上限
+        CdcConfig jobConfig = ResourcePlanner.apply(config, scan.tables);
+
+        // 3. 构建作业
+        StreamExecutionEnvironment env = createEnvironment(jobConfig, checkpointDir, restorePath.orElse(null));
+        TableFilter tableFilter = TableFilter.fromConfig(jobConfig, noPrimaryKeyTables);
+        env.fromSource(MySqlSourceFactory.create(jobConfig, tableFilter), WatermarkStrategy.noWatermarks(), "MySQL CDC Source")
                 .uid("mysql-cdc-source")
                 .keyBy(ChangeEvent::partitionKey)
-                .process(new ClickHouseWriter(config))
+                .process(new ClickHouseWriter(jobConfig))
                 .uid("clickhouse-writer")
                 .name("ClickHouse Writer");
 
-        // 3. 运行，并在进程退出时尝试 stop-with-savepoint
-        JobClient jobClient = env.executeAsync(config.getJobName());
-        LOG.info("作业已启动: {} (jobId={})", config.getJobName(), jobClient.getJobID());
+        // 4. 运行，并在进程退出时尝试 stop-with-savepoint
+        JobClient jobClient = env.executeAsync(jobConfig.getJobName());
+        LOG.info("作业已启动: {} (jobId={})", jobConfig.getJobName(), jobClient.getJobID());
         if (health != null) {
             health.setJobClient(jobClient);
         }
@@ -257,6 +262,8 @@ public class CdcApplication {
     static StreamExecutionEnvironment createEnvironment(CdcConfig config, Path checkpointDir, Path restorePath) {
         Configuration conf = new Configuration();
         conf.set(CoreOptions.DEFAULT_PARALLELISM, config.getJobParallelism());
+        // 内嵌集群的 IO 线程池默认为 4 × CPU 核数，容器未设 CPU 上限时按节点核数创建大量线程，这里只需少量
+        conf.set(ClusterOptions.CLUSTER_IO_EXECUTOR_POOL_SIZE, Math.min(4, Runtime.getRuntime().availableProcessors()));
         // checkpoint：保存在本地目录，作业取消后保留，用于进程重启后续传
         conf.set(StateBackendOptions.STATE_BACKEND, "hashmap");
         conf.set(CheckpointingOptions.CHECKPOINT_STORAGE, "filesystem");

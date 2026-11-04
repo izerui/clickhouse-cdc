@@ -254,6 +254,27 @@ class ClickHouseWriterTest {
     }
 
     @Test
+    void flushesAllBuffersWhenTotalBufferedBytesExceedLimit() throws Exception {
+        config = config.withOverrides(Map.of("sink.buffer.max-total-bytes", "60"));
+        tables.put("demo.t_order", List.of("id", "name", "_version", "_is_deleted", "_op", "_source_ts", "_synced_at"));
+        try (KeyedOneInputStreamOperatorTestHarness<String, ChangeEvent, Void> h = harness()) {
+            h.open();
+            h.processElement(dml(ChangeEvent.Op.CREATE, null, new Object[]{1L, "a"}), 0);
+            assertTrue(inserts.isEmpty());
+
+            // 两张表都没满批，但合计超过 60 字节：全部写出
+            ChangeEvent order = dml(ChangeEvent.Op.CREATE, null, new Object[]{2L, "b"});
+            order.table = "t_order";
+            h.processElement(order, 0);
+            assertEquals(2, inserts.size());
+
+            // 计数随写出归零，之后的小数据继续攒批
+            h.processElement(dml(ChangeEvent.Op.CREATE, null, new Object[]{3L, "c"}), 0);
+            assertEquals(2, inserts.size());
+        }
+    }
+
+    @Test
     void skipsColumnsMissingInTarget() throws Exception {
         try (KeyedOneInputStreamOperatorTestHarness<String, ChangeEvent, Void> h = harness()) {
             h.open();

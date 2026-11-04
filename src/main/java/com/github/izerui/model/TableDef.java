@@ -17,6 +17,10 @@ public class TableDef implements Serializable {
     public List<ColumnDef> columns = new ArrayList<>();
     /** 主键列，按主键顺序 */
     public List<String> primaryKeys = new ArrayList<>();
+    /** 源表平均行长度（字节，information_schema 统计值，用于估算全量阶段的内存占用） */
+    public long avgRowLength;
+    /** 源表估算行数（information_schema 统计值） */
+    public long estimatedRows;
 
     public TableDef() {
     }
