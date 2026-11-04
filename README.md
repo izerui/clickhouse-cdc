@@ -54,7 +54,7 @@ java -jar target/clickhouse-cdc.jar --config conf/application.properties
 |---|---|
 | `--config <path>` | 配置文件，默认 `conf/application.properties` |
 | `--fresh` | 删除已有 checkpoint，按 `startup.mode` 重新开始（initial 模式会清空目标表重新全量） |
-| `--force-resume` | 续传时跳过同步范围变化检查（确认新纳入的表只需增量时使用） |
+| `--force-resume` | 续传时跳过同步范围变化检查（确认新纳入的表只需增量时使用）；不能跳过目标库变化检查 |
 | `--restore <目录>` | 从指定的 checkpoint / savepoint 目录（含 `_metadata`）恢复，不自动清理其他 checkpoint |
 | `--verify` | 逐表比对 MySQL 与 ClickHouse 行数后退出，全部一致退出码 0，否则 3（不启动同步） |
 | `--key=value` | 覆盖配置文件中的任意配置项，如 `--job.parallelism=8` |
@@ -141,6 +141,7 @@ kubectl -n <命名空间> exec deploy/clickhouse-cdc -- sh -c 'exec java -Dlogba
 | 再次启动（存在 checkpoint） | 自动从最近的 checkpoint / savepoint 续传，忽略 `startup.mode` |
 | `--fresh` | 删除全部旧 checkpoint，按 `startup.mode` 重新开始 |
 | 同步范围变化后再次启动 | 拒绝启动。`source.databases`、`source.tables`、`source.tables.*` 变化，或上次因无主键未同步的表现已有主键，续传会让新纳入的表缺少全量数据。需恢复原配置、使用 `--fresh`，或确认只需增量时加 `--force-resume` |
+| 修改 `clickhouse.database-mapping` 后再次启动 | 拒绝启动，`--force-resume` 也不能跳过：旧位点之前的数据都在原来的库里，续写到新库会缺少全部历史数据。需恢复原映射，或使用 `--fresh` 重新全量到新库 |
 
 - checkpoint 保存在 `checkpoint.dir`（默认 `./data/checkpoints`），每 `checkpoint.interval-ms` 一次；**该目录就是同步进度，请持久化保存**。
 - 每次启动都是一个新的 Flink 作业；新作业产生第一个 checkpoint 后，自动清理旧作业留下的 checkpoint / savepoint。
@@ -258,7 +259,8 @@ Apache Flink CDC 官方目前没有 ClickHouse pipeline 连接器；ClickHouse �
 ## 约束与说明
 
 - **无主键表不同步**：启动时会打印被跳过的表。
-- **库名、表名与 MySQL 完全一致**，不做任何改名、映射或多表合并。
+- **表名与 MySQL 完全一致**；库名默认也一致，需要时配置 `clickhouse.database-mapping=源库:目标库`（多个用逗号分隔，不能把多个源库映射到同一个库）。不做多表合并。
+- **`clickhouse.database-mapping` 是"改写入的目标库"，不是给已有的 ClickHouse 库改名**：数据不会从原来的库搬过去。已有同步进度时修改映射，必须用 `--fresh` 启动：删除旧进度，按默认配置（`sink.truncate-before-snapshot=true`）**清空新库中与源表同名的表**，再全量同步到新库；**原来的库及其数据保持不动**，不再更新，确认不用后需手工删除。
 - **修改主键列值**：会写入一条旧主键的删除行和一条新主键的新增行。
 - **主键定义变化**（增减主键列）：ClickHouse 无法修改排序键，需要人工重建目标表后用 `--fresh` 重新全量。
 - **分区**：默认不分区。如需分区，`clickhouse.partition-by` 必须使用同一主键下取值不变的列，否则 ReplacingMergeTree 无法跨分区去重。

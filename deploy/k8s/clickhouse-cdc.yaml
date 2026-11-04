@@ -33,6 +33,8 @@ data:
     clickhouse.url=http://clickhouse:8123
     clickhouse.username=default
     clickhouse.password=${CLICKHOUSE_PASSWORD}
+    # ClickHouse 库名默认与 MySQL 相同；需要改名时配置 源库:目标库，例如: demo:demo_ch
+    clickhouse.database-mapping=
 
     # K8s 探针使用
     health.port=8080

@@ -303,7 +303,7 @@ public class ClickHouseWriter extends KeyedProcessFunction<String, ChangeEvent, 
         boolean schemaResynced = false;
         for (int attempt = 0; ; attempt++) {
             try {
-                client.insert(buffer.database, buffer.table, buffer.quotedColumns(), buffer.data.array(), buffer.data.size());
+                client.insert(config.getClickHouseDatabase(buffer.database), buffer.table, buffer.quotedColumns(), buffer.data.array(), buffer.data.size());
                 break;
             } catch (ClickHouseException e) {
                 if (!schemaResynced && isSchemaMismatch(e)) {

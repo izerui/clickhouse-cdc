@@ -97,6 +97,15 @@ public class CdcConfig implements Serializable {
                 throw new IllegalArgumentException("source.tables 中的 " + table + " 所属库不在 source.databases 中");
             }
         }
+        Map<String, String> mapping = getClickHouseDatabaseMapping();
+        for (String source : mapping.keySet()) {
+            if (!getSourceDatabases().contains(source)) {
+                throw new IllegalArgumentException("clickhouse.database-mapping 中的 " + source + " 不在 source.databases 中");
+            }
+        }
+        if (getSourceDatabases().stream().map(this::getClickHouseDatabase).distinct().count() < getSourceDatabases().size()) {
+            throw new IllegalArgumentException("clickhouse.database-mapping 不能把多个源库写入同一个 ClickHouse 库: " + mapping);
+        }
         if (getHealthPort() > 0 && getHealthPort() == getJobWebUiPort()) {
             throw new IllegalArgumentException("health.port 与 job.web-ui.port 不能相同: " + getHealthPort());
         }
@@ -264,6 +273,26 @@ public class CdcConfig implements Serializable {
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }
 
+    /**
+     * ClickHouse 库名映射：MySQL 库名 → ClickHouse 库名，格式 源库:目标库,源库:目标库。未配置映射的库与 MySQL 同名。
+     */
+    public Map<String, String> getClickHouseDatabaseMapping() {
+        Map<String, String> mapping = new LinkedHashMap<>();
+        for (String entry : splitList(get("clickhouse.database-mapping", ""))) {
+            String[] pair = entry.split(":");
+            if (pair.length != 2 || pair[0].isBlank() || pair[1].isBlank()) {
+                throw new IllegalArgumentException("clickhouse.database-mapping 格式应为 源库:目标库，多个用逗号分隔: " + entry);
+            }
+            mapping.put(pair[0].trim(), pair[1].trim());
+        }
+        return mapping;
+    }
+
+    /** 源库在 ClickHouse 中对应的库名 */
+    public String getClickHouseDatabase(String sourceDatabase) {
+        return getClickHouseDatabaseMapping().getOrDefault(sourceDatabase, sourceDatabase);
+    }
+
     public String getClickHouseUsername() {
         return get("clickhouse.username", "default");
     }
@@ -409,6 +438,15 @@ public class CdcConfig implements Serializable {
                 + "source.tables=" + String.join(",", getSourceTables()) + "\n"
                 + "source.tables.include=" + getSourceTablesInclude() + "\n"
                 + "source.tables.exclude=" + getSourceTablesExclude() + "\n";
+    }
+
+    /** 每个源库写入的 ClickHouse 库：源库 → 目标库 */
+    public Map<String, String> getTargetDatabases() {
+        Map<String, String> targets = new LinkedHashMap<>();
+        for (String database : getSourceDatabases()) {
+            targets.put(database, getClickHouseDatabase(database));
+        }
+        return targets;
     }
 
     /** 打印用：隐藏密码 */

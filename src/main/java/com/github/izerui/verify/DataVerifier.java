@@ -71,7 +71,8 @@ public class DataVerifier {
         return results;
     }
 
-    private long targetCount(String database, String table) {
+    private long targetCount(String sourceDatabase, String table) {
+        String database = config.getClickHouseDatabase(sourceDatabase);
         List<String[]> exists = client.query("SELECT count() FROM system.tables WHERE database = "
                 + ClickHouseSql.literal(database) + " AND name = " + ClickHouseSql.literal(table));
         if (exists.isEmpty() || "0".equals(exists.get(0)[0])) {

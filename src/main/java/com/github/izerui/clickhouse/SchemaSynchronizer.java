@@ -18,7 +18,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 让 ClickHouse 目标表结构与 MySQL 源表保持一致（库名、表名相同）。
+ * 让 ClickHouse 目标表结构与 MySQL 源表保持一致（表名相同，库名默认相同，可通过 clickhouse.database-mapping 映射）。
+ * <p>
+ * 所有公开方法接收的都是 MySQL 源库名，在访问 ClickHouse 时换算为目标库名。
  * <p>
  * 采用“结构比对”而不是“翻译 DDL 语句”：拿到源表变更后的完整结构，与目标表现有列比较，
  * 补齐新增列、修改类型变化的列、删除多余列。只有列重命名无法通过比对识别，需要从 DDL 中解析。
@@ -38,6 +40,7 @@ public class SchemaSynchronizer implements Serializable {
     private final String partitionBy;
     private final String tableSettings;
     private final boolean dropColumnEnabled;
+    private final CdcConfig config;
 
     private final Set<String> knownDatabases = new HashSet<>();
 
@@ -47,6 +50,12 @@ public class SchemaSynchronizer implements Serializable {
         this.partitionBy = config.getClickHousePartitionBy();
         this.tableSettings = config.getClickHouseTableSettings();
         this.dropColumnEnabled = config.isSinkDropColumnEnabled();
+        this.config = config;
+    }
+
+    /** 源库在 ClickHouse 中对应的库名 */
+    private String target(String sourceDatabase) {
+        return config.getClickHouseDatabase(sourceDatabase);
     }
 
     /**
@@ -54,7 +63,7 @@ public class SchemaSynchronizer implements Serializable {
      */
     public Map<String, String[]> describe(String database, String table) {
         List<String[]> rows = client.query("SELECT name, type, comment FROM system.columns WHERE database = "
-                + ClickHouseSql.literal(database) + " AND table = " + ClickHouseSql.literal(table) + " ORDER BY position");
+                + ClickHouseSql.literal(target(database)) + " AND table = " + ClickHouseSql.literal(table) + " ORDER BY position");
         if (rows.isEmpty()) {
             return null;
         }
@@ -66,8 +75,8 @@ public class SchemaSynchronizer implements Serializable {
     }
 
     public void ensureDatabase(String database) {
-        if (knownDatabases.add(database)) {
-            client.execute(ClickHouseSql.createDatabase(database));
+        if (knownDatabases.add(target(database))) {
+            client.execute(ClickHouseSql.createDatabase(target(database)));
         }
     }
 
@@ -77,16 +86,16 @@ public class SchemaSynchronizer implements Serializable {
      * @param ddl 触发本次同步的源端 DDL，用于识别列重命名；启动时为 null
      */
     public void sync(TableDef source, String ddl) {
-        String database = source.database;
+        String database = target(source.database);
         String table = source.table;
         if (!source.hasPrimaryKey()) {
             LOG.warn("表 {} 没有主键，跳过同步", source.fullName());
             return;
         }
-        ensureDatabase(database);
-        Map<String, String[]> existing = describe(database, table);
+        ensureDatabase(source.database);
+        Map<String, String[]> existing = describe(source.database, table);
         if (existing == null) {
-            String sql = ClickHouseSql.createTable(source, timeZone, partitionBy, tableSettings);
+            String sql = ClickHouseSql.createTable(database, source, timeZone, partitionBy, tableSettings);
             LOG.info("创建表 {}.{}:\n{}", database, table, sql);
             client.execute(sql);
             return;
@@ -100,7 +109,7 @@ public class SchemaSynchronizer implements Serializable {
                 String to = rename.getValue();
                 if (existing.containsKey(from) && !existing.containsKey(to) && source.getColumn(to) != null) {
                     execute(ClickHouseSql.renameColumn(database, table, from, to));
-                    existing = describe(database, table);
+                    existing = describe(source.database, table);
                 }
             }
         }
@@ -157,15 +166,15 @@ public class SchemaSynchronizer implements Serializable {
         ensureDatabase(source.database);
         Map<String, String[]> existing = describe(source.database, source.table);
         if (existing == null) {
-            String sql = ClickHouseSql.createTable(source, timeZone, partitionBy, tableSettings);
-            LOG.info("创建表 {}:\n{}", source.fullName(), sql);
+            String sql = ClickHouseSql.createTable(target(source.database), source, timeZone, partitionBy, tableSettings);
+            LOG.info("创建表 {}.{}:\n{}", target(source.database), source.table, sql);
             client.execute(sql);
             return;
         }
         String previous = null;
         for (ColumnDef column : source.columns) {
             if (!existing.containsKey(column.name)) {
-                execute(ClickHouseSql.addColumn(source.database, source.table, column,
+                execute(ClickHouseSql.addColumn(target(source.database), source.table, column,
                         source.primaryKeys.contains(column.name), timeZone, previous));
             }
             previous = column.name;
@@ -174,13 +183,13 @@ public class SchemaSynchronizer implements Serializable {
 
     public boolean exists(String database, String table) {
         List<String[]> rows = client.query("SELECT count() FROM system.tables WHERE database = "
-                + ClickHouseSql.literal(database) + " AND name = " + ClickHouseSql.literal(table));
+                + ClickHouseSql.literal(target(database)) + " AND name = " + ClickHouseSql.literal(table));
         return !rows.isEmpty() && !"0".equals(rows.get(0)[0]);
     }
 
     public void renameTable(String fromDatabase, String fromTable, String toDatabase, String toTable) {
         ensureDatabase(toDatabase);
-        execute(ClickHouseSql.renameTable(fromDatabase, fromTable, toDatabase, toTable));
+        execute(ClickHouseSql.renameTable(target(fromDatabase), fromTable, target(toDatabase), toTable));
     }
 
     /**
@@ -188,7 +197,7 @@ public class SchemaSynchronizer implements Serializable {
      */
     private void warnIfPrimaryKeyChanged(TableDef source) {
         List<String[]> rows = client.query("SELECT sorting_key FROM system.tables WHERE database = "
-                + ClickHouseSql.literal(source.database) + " AND name = " + ClickHouseSql.literal(source.table));
+                + ClickHouseSql.literal(target(source.database)) + " AND name = " + ClickHouseSql.literal(source.table));
         if (rows.isEmpty() || rows.get(0)[0] == null) {
             return;
         }
@@ -197,16 +206,16 @@ public class SchemaSynchronizer implements Serializable {
         if (!current.equals(expected)) {
             LOG.warn("表 {}.{} 主键已变化：目标排序键 ({})，源表主键 ({})。ClickHouse 无法修改排序键，"
                             + "请删除目标表后使用 --fresh 重新全量同步，否则数据去重会按旧主键进行",
-                    source.database, source.table, current, expected);
+                    target(source.database), source.table, current, expected);
         }
     }
 
     public void truncate(String database, String table) {
-        execute(ClickHouseSql.truncateTable(database, table));
+        execute(ClickHouseSql.truncateTable(target(database), table));
     }
 
     public void drop(String database, String table) {
-        execute(ClickHouseSql.dropTable(database, table));
+        execute(ClickHouseSql.dropTable(target(database), table));
     }
 
     private static ColumnDef copyAsNullable(ColumnDef c) {

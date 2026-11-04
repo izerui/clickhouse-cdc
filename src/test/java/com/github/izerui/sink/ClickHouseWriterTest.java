@@ -275,6 +275,23 @@ class ClickHouseWriterTest {
     }
 
     @Test
+    void writesToMappedClickHouseDatabase() throws Exception {
+        // demo 库映射到 ClickHouse 的 demo_ch 库；目标表不存在，按 MySQL 源表结构在 demo_ch 中创建
+        config = config.withOverrides(Map.of("clickhouse.database-mapping", "demo:demo_ch"));
+        tables.clear();
+        try (KeyedOneInputStreamOperatorTestHarness<String, ChangeEvent, Void> h = harness()) {
+            h.open();
+            h.processElement(dml(ChangeEvent.Op.CREATE, null, new Object[]{1L, "a"}), 0);
+            h.snapshot(1L, 1L);
+        }
+        assertTrue(statements.stream().anyMatch(sql -> sql.startsWith("CREATE DATABASE IF NOT EXISTS `demo_ch`")), statements.toString());
+        assertTrue(statements.stream().anyMatch(sql -> sql.startsWith("CREATE TABLE IF NOT EXISTS `demo_ch`.`t_user`")), statements.toString());
+        assertEquals(1, inserts.size());
+        assertTrue(inserts.get(0)[0].startsWith("INSERT INTO `demo_ch`.`t_user`"), inserts.get(0)[0]);
+        assertTrue(statements.stream().noneMatch(sql -> sql.contains("`demo`.")), "不应访问与 MySQL 同名的库");
+    }
+
+    @Test
     void skipsColumnsMissingInTarget() throws Exception {
         try (KeyedOneInputStreamOperatorTestHarness<String, ChangeEvent, Void> h = harness()) {
             h.open();

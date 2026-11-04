@@ -44,6 +44,26 @@ class CdcConfigTest {
     }
 
     @Test
+    void databaseMapping() {
+        Map<String, String> m = required();
+        m.put("clickhouse.database-mapping", "a:a_ch");
+        CdcConfig config = new CdcConfig(m);
+        assertEquals("a_ch", config.getClickHouseDatabase("a"));
+        assertEquals("b", config.getClickHouseDatabase("b"), "未映射的库与 MySQL 同名");
+        assertEquals(Map.of("a", "a_ch", "b", "b"), config.getTargetDatabases());
+
+        Map<String, String> unknown = required();
+        unknown.put("clickhouse.database-mapping", "x:y");
+        assertThrows(IllegalArgumentException.class, () -> new CdcConfig(unknown));
+        Map<String, String> badFormat = required();
+        badFormat.put("clickhouse.database-mapping", "a");
+        assertThrows(IllegalArgumentException.class, () -> new CdcConfig(badFormat));
+        Map<String, String> sameTarget = required();
+        sameTarget.put("clickhouse.database-mapping", "a:b");
+        assertThrows(IllegalArgumentException.class, () -> new CdcConfig(sameTarget), "a 映射到 b 与源库 b 冲突");
+    }
+
+    @Test
     void validation() {
         Map<String, String> missing = required();
         missing.remove("source.databases");

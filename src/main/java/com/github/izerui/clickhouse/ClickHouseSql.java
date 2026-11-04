@@ -53,6 +53,11 @@ public final class ClickHouseSql {
     }
 
     public static String createTable(TableDef def, ZoneId timeZone, String partitionBy, String settings) {
+        return createTable(def.database, def, timeZone, partitionBy, settings);
+    }
+
+    /** 在指定的 ClickHouse 库中按源表结构建表 */
+    public static String createTable(String database, TableDef def, ZoneId timeZone, String partitionBy, String settings) {
         List<String> lines = new ArrayList<>();
         for (ColumnDef c : def.columns) {
             lines.add("    " + columnDefinition(c, def.primaryKeys.contains(c.name), timeZone));
@@ -65,7 +70,7 @@ public final class ClickHouseSql {
         lines.add("    " + quote(COL_SYNCED_AT) + " DateTime64(3, " + tz + ") DEFAULT now64(3)");
 
         StringBuilder sql = new StringBuilder();
-        sql.append("CREATE TABLE IF NOT EXISTS ").append(table(def.database, def.table)).append("\n(\n")
+        sql.append("CREATE TABLE IF NOT EXISTS ").append(table(database, def.table)).append("\n(\n")
                 .append(String.join(",\n", lines)).append("\n)\n")
                 .append("ENGINE = ReplacingMergeTree(").append(quote(COL_VERSION)).append(", ").append(quote(COL_IS_DELETED)).append(")\n");
         if (partitionBy != null && !partitionBy.isBlank()) {
