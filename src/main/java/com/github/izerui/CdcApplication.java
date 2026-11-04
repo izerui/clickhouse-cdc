@@ -20,6 +20,7 @@ import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.jobgraph.SavepointConfigOptions;
@@ -331,6 +332,10 @@ public class CdcApplication {
         int webUiPort = config.getJobWebUiPort();
         if (webUiPort > 0) {
             conf.set(RestOptions.PORT, webUiPort);
+            // 禁止通过 Web UI / REST 上传、运行 jar（可执行任意代码）；隐藏取消按钮。
+            // 注意 CANCEL_ENABLE 只影响页面，REST 接口仍可取消作业，因此 Web UI 不能无鉴权对外开放
+            conf.set(WebOptions.SUBMIT_ENABLE, false);
+            conf.set(WebOptions.CANCEL_ENABLE, false);
             return StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf);
         }
         return StreamExecutionEnvironment.createLocalEnvironment(config.getJobParallelism(), conf);

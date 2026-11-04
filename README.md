@@ -101,6 +101,8 @@ kubectl -n <命名空间> exec deploy/clickhouse-cdc -- sh -c 'exec java -Dlogba
 - **资源**：只需设置 `limits.memory`（建议至少 1Gi）：镜像启动脚本按它计算 JVM 堆，程序再按堆大小计算并行度、分片大小、写入缓冲（见"内存与资源自适应"）。
 - **NAS 存储**：NFS 卷不支持 fsGroup 自动改属主，清单中的 initContainer 会先把数据目录交给运行用户；云盘等块存储可删除该 initContainer。
 
+- **Flink Web UI**：配置 `job.web-ui.port=8081` 后通过本地端口转发查看（`kubectl port-forward deploy/<名称> 8081:8081`，打开 `http://localhost:8081`），可看作业状态、各环节流量与反压、checkpoint 历史和异常。界面为只读：禁止上传 / 运行 jar；取消按钮已隐藏，但 REST 接口仍可取消作业（取消后进程退出，由 K8s 重启并从 checkpoint 续传）。不要通过 Service / Ingress 对外暴露。
+
 本地运行时健康检查默认关闭（`health.port=0`），日志同时输出到控制台和 `logs/`；容器内通过 `-Dlogback.configurationFile=logback-console.xml` 只输出到标准输出。
 
 ## 内存与资源自适应
