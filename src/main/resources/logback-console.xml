@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 容器环境使用：日志只输出到标准输出，由 K8s / 日志采集组件收集 -->
+<configuration>
+    <property name="PATTERN" value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Flink / Debezium 内部日志较多，默认只输出警告 -->
+    <logger name="org.apache.flink" level="WARN"/>
+    <logger name="org.apache.flink.cdc" level="INFO"/>
+    <logger name="org.apache.flink.runtime.checkpoint.CheckpointCoordinator" level="INFO"/>
+    <logger name="io.debezium" level="WARN"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="com.github.shyiko.mysql.binlog" level="WARN"/>
+    <logger name="com.github.izerui" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

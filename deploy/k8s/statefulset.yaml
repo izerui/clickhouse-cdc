@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse-cdc
+spec:
+  serviceName: clickhouse-cdc
+  # 只能是 1：多个实例会重复消费 binlog，并争用同一份同步进度
+  replicas: 1
+  template:
+    spec:
+      # 大于 stop-with-savepoint 的等待时间（120 秒），保证退出前保存同步进度
+      terminationGracePeriodSeconds: 180
+      imagePullSecrets:
+        - name: harbor-registry
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: clickhouse-cdc
+          image: clickhouse-cdc
+          # 使用 latest 标签，每次启动 Pod 都拉取最新镜像
+          imagePullPolicy: Always
+          # 需要重新全量同步时，临时加上 ["--fresh"] 后 apply，同步开始后再去掉
+          args: []
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError -Dlogback.configurationFile=logback-console.xml"
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-cdc-secret
+                  key: MYSQL_PASSWORD
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-cdc-secret
+                  key: CLICKHOUSE_PASSWORD
+          ports:
+            - name: health
+              containerPort: 8080
+          # 启动阶段要预建 / 校正所有目标表，表多时较慢，给足时间（最长 10 分钟）
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 60
+          # 只检查进程存活：MySQL / ClickHouse 暂时不可用时作业会在进程内自动重试，重建 Pod 无助于恢复
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # 作业处于 RUNNING 时就绪，用于观察同步状态
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /app/conf
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+            # Flink 本地集群的临时文件
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: clickhouse-cdc-config
+        - name: tmp
+          emptyDir: {}
+  # 同步进度（checkpoint）持久化：Pod 重建后从原 binlog 位点续传，删除此 PVC 等于丢失进度
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: standard
+        resources:
+          requests:
+            storage: 10Gi

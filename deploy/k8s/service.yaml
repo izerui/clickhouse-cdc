@@ -1,0 +1,11 @@
+# StatefulSet 需要的 headless Service；同时暴露健康检查端口，便于集群内查看同步状态
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-cdc
+spec:
+  clusterIP: None
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
